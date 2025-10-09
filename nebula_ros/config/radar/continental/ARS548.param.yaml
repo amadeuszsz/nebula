@@ -26,6 +26,9 @@
           ok: 1
           warn: 1
       rate_bound_status:
+        dynamic_delta_threshold_hz: 10.0
+        num_frame_transition: 3
+        immediate_error_report: false
         frequency_ok:
           min_hz: 9.0
           max_hz: 11.0

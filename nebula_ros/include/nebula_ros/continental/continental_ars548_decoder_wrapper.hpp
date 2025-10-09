@@ -43,6 +43,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -177,8 +178,12 @@ private:
   static custom_diagnostic_tasks::RateBoundStatus make_rate_bound_status(
     rclcpp::Node * const node, const std::string & name)
   {
-    static constexpr size_t num_frame_transition = 3;
-    static constexpr bool immediate_error_report = true;
+    auto read_bool_param = [&node](const std::string & param_name) {
+      if (node->has_parameter(param_name)) {
+        return node->get_parameter(param_name).as_bool();
+      }
+      return node->declare_parameter<bool>(param_name, false, param_read_only());
+    };
 
     auto read_fp_param = [&node](const std::string & param_name) {
       if (node->has_parameter(param_name)) {
@@ -187,15 +192,35 @@ private:
       return node->declare_parameter<double>(param_name, param_read_only());
     };
 
+    auto read_int_param = [&node](const std::string & param_name) {
+      if (node->has_parameter(param_name)) {
+        return node->get_parameter(param_name).as_int();
+      }
+      return node->declare_parameter<int64_t>(param_name, param_read_only());
+    };
+
     double min_ok_hz = read_fp_param("diagnostics.rate_bound_status.frequency_ok.min_hz");
     double max_ok_hz = read_fp_param("diagnostics.rate_bound_status.frequency_ok.max_hz");
     double min_warn_hz = read_fp_param("diagnostics.rate_bound_status.frequency_warn.min_hz");
     double max_warn_hz = read_fp_param("diagnostics.rate_bound_status.frequency_warn.max_hz");
+    const double dynamic_delta_threshold_hz =
+      read_fp_param("diagnostics.rate_bound_status.dynamic_delta_threshold_hz");
+    const int64_t num_frame_transition =
+      read_int_param("diagnostics.rate_bound_status.num_frame_transition");
+    const bool immediate_error_report =
+      read_bool_param("diagnostics.rate_bound_status.immediate_error_report");
 
     custom_diagnostic_tasks::RateBoundStatusParam ok_params(min_ok_hz, max_ok_hz);
     custom_diagnostic_tasks::RateBoundStatusParam warn_params(min_warn_hz, max_warn_hz);
 
-    return {node, ok_params, warn_params, num_frame_transition, immediate_error_report, name};
+    return {
+      node,
+      ok_params,
+      warn_params,
+      static_cast<size_t>(num_frame_transition),
+      immediate_error_report,
+      dynamic_delta_threshold_hz,
+      name};
   }
 
   custom_diagnostic_tasks::RateBoundStatus objects_rate_bound_status_;

@@ -116,19 +116,27 @@ public:
    * \param immediate_error_report If true (default), errors related to the rate bounds will be
    * reported immediately once observed; otherwise, the hysteresis damping method using
    * `num_frame_transition` will be adopted
+   * \param dynamic_delta_threshold_hz If non-zero, delay from sample N-1 will be summed up to the
+   * all upper frequency bounds in sample N. For examples for the threshold of 10 Hz,
+   * ok_params.max_frequency=11 Hz and warn_params.max_frequency=12 Hz and the observed
+   * frequency 9.5 Hz, the next frame bound will be ok_params.max_frequency=11.5 Hz and
+   * warn_params.max_frequency=12.5 Hz.
    * \param name The arbitrary string to be assigned for this diagnostic task.
    * This name will not be exposed in the actual published topics.
    */
   RateBoundStatus(
     const rclcpp::Node * parent_node, const RateBoundStatusParam & ok_params,
     const RateBoundStatusParam & warn_params, const size_t num_frame_transition = 1,
-    const bool immediate_error_report = true, const std::string & name = "rate bound check")
+    const bool immediate_error_report = true, const double dynamic_delta_threshold_hz = 0.0,
+    const std::string & name = "rate bound check")
   : DiagnosticTask(name),
     ok_params_(ok_params),
     warn_params_(warn_params),
     num_frame_transition_(num_frame_transition),
     immediate_error_report_(immediate_error_report),
+    dynamic_delta_threshold_hz_(dynamic_delta_threshold_hz),
     zero_seen_(false),
+    dynamic_upper_delta_hz_(0.0),
     candidate_state_(Stale{}),
     current_state_(Stale{})
   {
@@ -190,11 +198,14 @@ public:
     if (!frequency_ || zero_seen_) {
       frame_result.emplace<Stale>();
     } else {
-      if (ok_params_.min_frequency < frequency_ && frequency_ < ok_params_.max_frequency) {
+      if (
+        ok_params_.min_frequency < frequency_ &&
+        frequency_ < ok_params_.max_frequency + dynamic_upper_delta_hz_) {
         frame_result.emplace<Ok>();
       } else if (
         (warn_params_.min_frequency <= frequency_ && frequency_ <= ok_params_.min_frequency) ||
-        (ok_params_.max_frequency <= frequency_ && frequency_ <= warn_params_.max_frequency)) {
+        (ok_params_.max_frequency + dynamic_upper_delta_hz_ <= frequency_ &&
+         frequency_ <= warn_params_.max_frequency + dynamic_upper_delta_hz_)) {
         frame_result.emplace<Warn>();
       } else {
         frame_result.emplace<Error>();
@@ -221,8 +232,10 @@ public:
 
     // If the classify result is same as previous one, count the number of observation
     // Otherwise, update candidate
-    if (candidate_state_.index() == frame_result.index()) {  // if result has the same status as
-                                                             // candidate
+    if (
+      candidate_state_.index() == frame_result.index() &&
+      candidate_state_.index() != current_state_.index()) {  // if result has the same status as
+                                                             // candidate but different from current
       std::visit([](auto & s) { s.num_observations += 1; }, candidate_state_);
     } else {
       candidate_state_ = frame_result;
@@ -231,10 +244,12 @@ public:
     // Update the current state if
     // - immediate error report is required and the observed state is error
     // - Or the same state is observed multiple times
+    // - Or the observed state has lower level than the current one (i.e. the state is improved)
     if (
       (immediate_error_report_ && std::holds_alternative<Error>(candidate_state_)) ||
       (is_valid_observation && get_num_observations(candidate_state_) >= num_frame_transition_) ||
-      (!is_valid_observation && num_frame_skipped >= num_frame_transition_)) {
+      (!is_valid_observation && num_frame_skipped >= num_frame_transition_) ||
+      candidate_state_.index() < current_state_.index()) {
       current_state_ = candidate_state_;
       std::visit([](auto & s) { s.num_observations = 1; }, candidate_state_);
     }
@@ -246,28 +261,16 @@ public:
     stat.add("Publish rate", ss.str());
 
     ss.str("");  // reset contents
-    ss << get_level_string(get_level(frame_result));
-    stat.add("Rate status", ss.str());
+    ss << get_level_string(get_level(current_state_));
+    stat.add("Effective rate status", ss.str());
 
     ss.str("");  // reset contents
-    ss << std::fixed << std::setprecision(2) << ok_params_.min_frequency;
-    stat.add("Minimum OK rate threshold", ss.str());
-
-    ss.str("");  // reset contents
-    ss << std::fixed << std::setprecision(2) << ok_params_.max_frequency;
-    stat.add("Maximum OK rate threshold", ss.str());
-
-    ss.str("");  // reset contents
-    ss << std::fixed << std::setprecision(2) << warn_params_.min_frequency;
-    stat.add("Minimum WARN rate threshold", ss.str());
-
-    ss.str("");  // reset contents
-    ss << std::fixed << std::setprecision(2) << warn_params_.max_frequency;
-    stat.add("Maximum WARN rate threshold", ss.str());
+    ss << get_level_string(get_level(candidate_state_));
+    stat.add("Candidate rate status", ss.str());
 
     ss.str("");  // reset contents
     ss << get_num_observations(candidate_state_);
-    stat.add("Observed frames", ss.str());
+    stat.add("Candidate status observed frames", ss.str());
 
     ss.str("");  // reset contents
     ss << num_frame_skipped;
@@ -276,6 +279,29 @@ public:
     ss.str("");  // reset contents
     ss << num_frame_transition_;
     stat.add("Observed frames transition threshold", ss.str());
+
+    ss.str("");  // reset contents
+    ss << std::fixed << std::setprecision(2) << ok_params_.min_frequency;
+    stat.add("Minimum OK rate threshold", ss.str());
+
+    ss.str("");  // reset contents
+    ss << std::fixed << std::setprecision(2) << ok_params_.max_frequency + dynamic_upper_delta_hz_;
+    stat.add("Maximum OK rate threshold", ss.str());
+
+    ss.str("");  // reset contents
+    ss << std::fixed << std::setprecision(2) << warn_params_.min_frequency;
+    stat.add("Minimum WARN rate threshold", ss.str());
+
+    ss.str("");  // reset contents
+    ss << std::fixed << std::setprecision(2)
+       << warn_params_.max_frequency + dynamic_upper_delta_hz_;
+    stat.add("Maximum WARN rate threshold", ss.str());
+
+    // update dynamic delta threshold for the next frame
+    if (dynamic_delta_threshold_hz_ != 0.0) {
+      dynamic_upper_delta_hz_ = std::max(
+        0.0, dynamic_delta_threshold_hz_ - frequency_.value_or(dynamic_delta_threshold_hz_));
+    }
   }
 
 protected:
@@ -283,7 +309,9 @@ protected:
   RateBoundStatusParam warn_params_;
   size_t num_frame_transition_;
   bool immediate_error_report_;
+  const double dynamic_delta_threshold_hz_;
   bool zero_seen_;
+  double dynamic_upper_delta_hz_;
   std::optional<double> frequency_;
   std::optional<double> previous_frame_timestamp_;
   std::mutex lock_;
